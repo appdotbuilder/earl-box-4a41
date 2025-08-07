@@ -49,7 +49,7 @@ const appRouter = router({
 export type AppRouter = typeof appRouter;
 
 // Custom file serving middleware
-function serveFile(req: any, res: any, next: any) {
+async function serveFile(req: any, res: any, next: any) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   
   // Handle file serving routes like /file/:id
@@ -57,15 +57,75 @@ function serveFile(req: any, res: any, next: any) {
     const fileId = url.pathname.split('/file/')[1];
     
     if (fileId) {
-      // TODO: Implement actual file serving logic
-      // 1. Get file metadata from database using fileId
-      // 2. Check if file exists on disk
-      // 3. Set proper content-type header based on mime_type
-      // 4. Stream file content to response
+      try {
+        // 1. Query the database for the file record using the fileId
+        const fileRecord = await getFile({ id: fileId });
+        
+        if (!fileRecord) {
+          // File not found in database
+          res.writeHead(404, { 'Content-Type': 'text/plain' });
+          res.end('File not found');
+          return;
+        }
+        
+        // 2. Construct the full file path on the server using file_path from database
+        const filePath = path.resolve(fileRecord.file_path);
+        
+        // 3. Check if the file exists on the filesystem
+        if (!fs.existsSync(filePath)) {
+          // File exists in database but not on disk
+          console.error(`File exists in database but not on disk: ${filePath}`);
+          res.writeHead(404, { 'Content-Type': 'text/plain' });
+          res.end('File not found on server');
+          return;
+        }
+        
+        // 4. Set the Content-Type header to the mime_type from database
+        const headers: Record<string, string> = {
+          'Content-Type': fileRecord.mime_type,
+          'Content-Length': fileRecord.file_size.toString(),
+          // Add cache headers for better performance
+          'Cache-Control': 'public, max-age=31536000', // 1 year
+          'ETag': `"${fileRecord.id}"`,
+        };
+        
+        // Handle conditional requests (If-None-Match)
+        const clientETag = req.headers['if-none-match'];
+        if (clientETag === `"${fileRecord.id}"`) {
+          res.writeHead(304);
+          res.end();
+          return;
+        }
+        
+        // 5. Stream the file content to the client
+        res.writeHead(200, headers);
+        
+        // Create read stream and pipe to response
+        const fileStream = fs.createReadStream(filePath);
+        
+        // Handle stream errors
+        fileStream.on('error', (streamError) => {
+          console.error('File stream error:', streamError);
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'text/plain' });
+            res.end('Internal server error');
+          }
+        });
+        
+        // Pipe file content to response
+        fileStream.pipe(res);
+        
+      } catch (error) {
+        // Handle database errors and other exceptions
+        console.error('File serving error:', error);
+        
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'text/plain' });
+          res.end('Internal server error');
+        }
+      }
       
-      res.writeHead(200, { 'Content-Type': 'text/plain' });
-      res.end('File serving not yet implemented');
-      return;
+      return; // Don't call next() for file serving routes
     }
   }
   
@@ -85,8 +145,14 @@ async function start() {
     middleware: (req, res, next) => {
       // Apply CORS first
       cors()(req, res, () => {
-        // Then apply file serving middleware
-        serveFile(req, res, next);
+        // Then apply file serving middleware (handle async)
+        serveFile(req, res, next).catch((error) => {
+          console.error('File serving middleware error:', error);
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'text/plain' });
+            res.end('Internal server error');
+          }
+        });
       });
     },
     router: appRouter,
